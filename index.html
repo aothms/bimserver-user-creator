@@ -1,0 +1,198 @@
+<html>
+<head>
+<script type='text/javascript' src='http://ajax.googleapis.com/ajax/libs/jquery/2.1.3/jquery.js'></script>
+<script type='text/javascript' src='./sjcl.js'></script>
+<script type='text/javascript' src='./papaparse.min.js'></script>
+<script type='text/javascript'>
+(function() {
+    
+    var TOKEN = null;
+    var RESPONSE = null;
+    var USER_ID = null;
+    var PROJECT_MAPPING = {};
+    
+    // Execute a request to the BIMserver API. Extracts authentication token and project information from responses.
+    var request = function(args) {
+        Object.keys(args.parameters).forEach(function (param) {
+            if (typeof args.parameters[param] === 'function') {
+                args.parameters[param] = args.parameters[param]();
+            }
+        });
+        args = {request:args};
+        if (TOKEN !== null) args.token = TOKEN;
+        return $.post($("#server_url").val() + "/json", JSON.stringify(args)).then(function(d) {
+            RESPONSE = d;
+            if (TOKEN === null) TOKEN = RESPONSE.response.result;
+            if (RESPONSE.response.result) {
+                var discover_project = function(o) {
+                    if (o.__type === "SProject") PROJECT_MAPPING[o.name] = o.oid;
+                };
+                if (RESPONSE.response.result.forEach) {
+                    RESPONSE.response.result.forEach(discover_project);
+                } else {
+                    discover_project(RESPONSE.response.result);
+                }
+            } else if (RESPONSE.response.exception) {
+                // NB: Not escaped:
+                $("#errors").append(RESPONSE.response.exception.message);
+                $("#errors").append("<br>");
+                console.log(args, RESPONSE);
+            }
+        });
+    };
+    
+    // A list of requests to be executed sequentially
+    var requests = [{
+        interface:   "Bimsie1AuthInterface",
+        method:      "login",
+        parameters: {"username": function() { return $("#username").val(); },
+                     "password": function() { return $("#password").val(); }}
+    }];
+    
+    // The final list of user-password pairs that has been added
+    var credentials = [];    
+    
+    // Create a project
+    var add_project_request = function(project_name) {
+        requests.push({
+            interface:   "Bimsie1ServiceInterface",
+            method:      "addProject",
+            parameters: {"projectName": project_name}
+        });
+    };
+    
+    // Add a user and add to project. A project name based on full_name will be
+    // generated if no project name is specified.
+    var add_user_request = function(email_address, full_name, project) {
+        var password = sjcl.codec.hex.fromBits(sjcl.random.randomWords(3));
+        credentials.push([email_address, password]);
+        requests.push({
+            interface:   "ServiceInterface",
+            method:      "addUser",
+            parameters: {"username"        : email_address,
+                         "name"            : full_name,
+                         "type"            : "USER",
+                         "selfRegistration": "false",
+                         "resetUrl"        : ""}    
+        });
+        requests.push({
+            interface:   "AuthInterface",
+            method:      "changePassword",
+            parameters: {"uoid"       : function() { return USER_ID = RESPONSE.response.result.oid; },
+                         "oldPassword": "",
+                         "newPassword": password}        
+        });
+        if (!project) {
+            project = "Project for '" + full_name + "' (" + (+new Date()) + ")";
+            add_project_request(project);
+        }
+        requests.push({
+            interface:   "ServiceInterface",
+            method:      "addUserToProject",
+            parameters:  {"uoid": function() { return USER_ID; }, "poid": function() { return PROJECT_MAPPING[project]; }}
+        });
+    };
+    
+    // Execute a requests. Returns a deferred that is resolved when all requests have been processed.
+    var d = null;
+    var execute_requests = function() {
+        if (d === null) d = new $.Deferred();
+        var r = requests.splice(0,1)[0];
+        if (r) {
+            request(r).then(execute_requests);
+        } else {
+            d.resolve(credentials);
+            d = null;
+        }
+        return d;
+    };
+    
+    // Triggers parsing the CSV data in the input box and creates and executes requests accordingly.
+    // Generated user and password information is appended to the textbox.
+    window.go = function() {
+        var data = Papa.parse($("#users").val()).data;
+        var added_projects = {};
+        data.filter(function(a) { return a.length >= 3; }).forEach(function(a) {
+            if (!(a[2] in added_projects)) {
+                add_project_request(a[2]);
+                added_projects[a[2]] = 1;
+            }
+        });
+        data.forEach(function(a) {
+            add_user_request.apply(null, a);
+        });
+        execute_requests().then(function(credentials) {
+            // NB: Not escaped:
+            $("#users").val($("#users").val() + "\n\n" + credentials.map(function(a) { 
+                return a.join(";");
+            }).join("\n"));
+        });
+    };
+})();
+</script>
+<style type='text/css'>
+html {
+    background: #eee;
+}
+body {
+    border: solid 1px #ddd;
+    width: 600px;
+    margin: 24px auto;
+    padding: 24px;
+    border-radius: 3px;
+    background: white;
+}
+textarea, input, button {
+    border: solid 1px #ddd;
+    display: block;
+    border-radius: 3px;
+    padding: 4px 10px;
+    margin: 10px 0;
+    box-sizing: border-box;
+}
+textarea {
+    width: 100%;
+    min-height: 300px;
+}
+input {
+    width: 400px;
+}
+button {
+    cursor: pointer;
+    float: right;
+    background: #eee;
+    padding: 8px 20px;
+}
+texarea:hover, input:hover, button:hover {
+    border-color: #aaa;
+}
+label {
+    float: left;
+    width: 200px;
+}
+.disclaimer, #errors {
+    color: red;
+}
+</style>
+</head>
+<body>
+<h1>BIMserver.org user generator</h1>
+<p>Write a row for each user you wish to add to your BIMserver. Optionally provide a (newly to be created) project you wish to add the user to on the same line, or one will be created automatically. Created users and generated passwords are appended to the text box once the script finishes.</p>
+<pre>
+Example: alice@company.org;Alice;Some great project
+         bob@company.org;Bob;Some great project
+         eve@otherfirm.org;Eve
+         
+         Results in &lsquo;Great project&rsquo; being created with users Alice and Bob.
+         Eve gets here own project named &lsquo;Project for &#39;Eve&#39;&rsquo;
+</pre>
+<p class='disclaimer'>Use at your own risk. Tested in Chrome, with BIMserver 1.3.4. There is no error handling, no transaction!</p>
+<textarea id="users"></textarea>
+<p>Provide the BIMserver URL and administrator credentials below.</p>
+<label for='server_url'>BIMserver URL</label><input type='text' id='server_url' value='http://'>
+<label for='username'>Administrator username</label><input type='text' id='username' value=''>
+<label for='username'>Administrator password</label><input type='password' id='password' value=''>
+<button onclick='go()'>Create users and projects</button>
+<p id='errors'></p>
+</body>
+</html>
